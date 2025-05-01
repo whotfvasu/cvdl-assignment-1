@@ -9,6 +9,11 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QLabel, QComboBox, QPushButton, QVBoxLayout,
     QWidget, QHBoxLayout, QMessageBox
 )
+import torch.hub
+# from PyQt5.QtWidgets import (
+#     QApplication, QMainWindow, QLabel, QComboBox, QPushButton, QVBoxLayout,
+#     QWidget, QHBoxLayout, QMessageBox
+# )
 from PyQt5.QtCore import QThread, pyqtSignal, Qt
 from PyQt5.QtGui import QImage, QPixmap, QFont
 
@@ -20,10 +25,8 @@ def convert_cv_qt(cv_img):
     return QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
 
 def get_device():
-    """Return the best available device: MPS (for Apple Silicon), CUDA, or CPU."""
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    elif torch.cuda.is_available():
+    """Return the best available device: CUDA or CPU for Windows."""
+    if torch.cuda.is_available():
         return torch.device("cuda")
     else:
         return torch.device("cpu")
@@ -46,7 +49,10 @@ class LiveFeedWorker(QThread):
             self.run_yolo()
         elif self.model_type == "Faster R-CNN":
             self.run_faster_rcnn()
+        elif self.model_type == "YOLOv5":
+            self.run_yolov5()
         self.finished.emit()
+
 
     def run_yolo(self):
         device = get_device()
@@ -95,72 +101,122 @@ class LiveFeedWorker(QThread):
 
         cap.release()
 
-    def run_faster_rcnn(self):
+    def run_yolov5(self):
         device = get_device()
-        rcnn_model = fasterrcnn_resnet50_fpn(pretrained=True)
-        rcnn_model.to(device)
-        rcnn_model.eval()
-
-        COCO_LABELS = [
-            '__background__', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
-            'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog',
-            'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella', 'shoe',
-            'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball', 'kite',
-            'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket', 'bottle', 'plate', 'wine glass',
-            'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange',
-            'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch', 'potted plant',
-            'bed', 'mirror', 'dining table', 'window', 'desk', 'toilet', 'door', 'tv', 'laptop', 'mouse',
-            'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book',
-            'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
-        ]
-
-        def preprocess_image(image):
-            transform = T.Compose([T.ToTensor()])
-            return transform(image).unsqueeze(0).to(device)
-
+        try:
+            # Try to load YOLOv5 from torch.hub (online)
+            print("Loading YOLOv5 model...")
+            model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True, trust_repo=True)
+            print("YOLOv5 model loaded successfully")
+        except Exception as e:
+            print(f"Error loading YOLOv5 from torch.hub: {e}")
+            # Fall back to YOLOv8 if YOLOv5 fails to load
+            print("Falling back to YOLOv8")
+            self.run_yolo()
+            return
+            
+        model.to(device)
+        
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
             print("Error: Could not open webcam.")
             return
 
+        prev_time = time.time()
         while self._running:
             if self._paused:
                 self.msleep(100)
                 continue
 
-            start_time = time.time()
             ret, frame = cap.read()
             if not ret:
                 print("Failed to grab frame.")
                 break
 
-            image_tensor = preprocess_image(frame)
-            with torch.no_grad():
-                outputs = rcnn_model(image_tensor)
+            current_time = time.time()
+            fps = 1 / (current_time - prev_time)
+            prev_time = current_time
 
-            for box, score, label in zip(outputs[0]['boxes'], outputs[0]['scores'], outputs[0]['labels']):
-                if score > 0.5:
-                    x1, y1, x2, y2 = map(int, box.tolist())
-                    class_id = int(label.item())
-                    class_name = COCO_LABELS[class_id] if class_id < len(COCO_LABELS) else "Unknown"
-                    confidence = round(float(score.item()), 2)
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (200, 0, 0), 2)
-                    cv2.putText(frame, f"{class_name} | {confidence:.2f}", (x1, y1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 0, 0), 2)
-
-            total_time = time.time() - start_time
-            fps = 1.0 / total_time if total_time > 0 else 0.0
-
-            cv2.putText(frame, f"FPS: {fps:.2f}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 200, 0), 2)
-            q_img = convert_cv_qt(frame)
+            # YOLOv5 inference
+            results = model(frame)
+            
+            # Get the annotated frame but make a copy of it first
+            results_frame = results.render()[0].copy()  # Make a copy to make it writable
+            
+            cv2.putText(results_frame, f"FPS: {fps:.2f}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            q_img = convert_cv_qt(results_frame)
             self.changePixmap.emit(q_img)
             self.msleep(30)
 
         cap.release()
 
-    def stop(self):
-        self._running = False
+        def run_faster_rcnn(self):
+            device = get_device()
+            rcnn_model = fasterrcnn_resnet50_fpn(pretrained=True)
+            rcnn_model.to(device)
+            rcnn_model.eval()
+
+            COCO_LABELS = [
+                '__background__', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
+                'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog',
+                'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella', 'shoe',
+                'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball', 'kite',
+                'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket', 'bottle', 'plate', 'wine glass',
+                'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange',
+                'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch', 'potted plant',
+                'bed', 'mirror', 'dining table', 'window', 'desk', 'toilet', 'door', 'tv', 'laptop', 'mouse',
+                'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book',
+                'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
+            ]
+
+            def preprocess_image(image):
+                transform = T.Compose([T.ToTensor()])
+                return transform(image).unsqueeze(0).to(device)
+
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                print("Error: Could not open webcam.")
+                return
+
+            while self._running:
+                if self._paused:
+                    self.msleep(100)
+                    continue
+
+                start_time = time.time()
+                ret, frame = cap.read()
+                if not ret:
+                    print("Failed to grab frame.")
+                    break
+
+                image_tensor = preprocess_image(frame)
+                with torch.no_grad():
+                    outputs = rcnn_model(image_tensor)
+
+                for box, score, label in zip(outputs[0]['boxes'], outputs[0]['scores'], outputs[0]['labels']):
+                    if score > 0.5:
+                        x1, y1, x2, y2 = map(int, box.tolist())
+                        class_id = int(label.item())
+                        class_name = COCO_LABELS[class_id] if class_id < len(COCO_LABELS) else "Unknown"
+                        confidence = round(float(score.item()), 2)
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (200, 0, 0), 2)
+                        cv2.putText(frame, f"{class_name} | {confidence:.2f}", (x1, y1 - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 0, 0), 2)
+
+                total_time = time.time() - start_time
+                fps = 1.0 / total_time if total_time > 0 else 0.0
+
+                cv2.putText(frame, f"FPS: {fps:.2f}", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 200, 0), 2)
+                q_img = convert_cv_qt(frame)
+                self.changePixmap.emit(q_img)
+                self.msleep(30)
+
+            cap.release()
+
+        def stop(self):
+            self._running = False
 
 class CompareWorker(QThread):
     changePixmapYOLO = pyqtSignal(QImage)
@@ -419,6 +475,7 @@ class MainWindow(QMainWindow):
         self.combo = QComboBox()
         self.combo.addItems([
             "Real-Time Detection (YOLOv8)",
+            "Real-Time Detection (YOLOv5)",
             "Real-Time Detection (Faster R-CNN)",
             "Compare Models"
         ])
@@ -439,6 +496,8 @@ class MainWindow(QMainWindow):
         else:
             if "YOLOv8" in model_choice:
                 model_type = "YOLOv8"
+            elif "YOLOv5" in model_choice:
+                model_type = "YOLOv5"
             elif "Faster" in model_choice:
                 model_type = "Faster R-CNN"
             else:
